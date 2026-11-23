@@ -1,0 +1,99 @@
+name: Build
+
+# 触发条件：主干分支的推送、PR、打标签、以及手动触发
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths-ignore:
+      - '**.md'
+      - 'release/**'
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'release/**'
+  workflow_dispatch:
+
+# 最小权限：CI 只需要读代码
+permissions:
+  contents: read
+
+# 同一分支的新推送取消上一次未完成的构建，节省额度
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # CMake 生成器与构建配置，集中在这里方便调整
+  CMAKE_GENERATOR: Visual Studio 17 2022
+
+jobs:
+  build:
+    name: ${{ matrix.config }} (x64)
+    runs-on: windows-latest   # 自带 VS2022 + Windows SDK + CMake/Ninja
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false        # Debug 失败时也要看到 Release 的结果
+      matrix:
+        config: [Release, Debug]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ImGui / MinHook 由 CMake 的 FetchContent 在 configure 阶段从 GitHub 拉取，
+      # 缓存 build/_deps 可以把每次 CI 的克隆时间降到接近 0。
+      # 不写 restore-keys：CMakeLists.txt 改了依赖版本就必须重新拉取，避免用陈旧副本。
+      - name: Cache FetchContent dependencies
+        uses: actions/cache@v4
+        with:
+          path: build\_deps
+          key: deps-${{ runner.os }}-${{ hashFiles('CMakeLists.txt', '**/CMakeLists.txt') }}
+
+      - name: Configure (CMake)
+        run: >
+          cmake -S . -B build
+          -G "$env:CMAKE_GENERATOR" -A x64
+          -DCMAKE_CONFIGURATION_TYPES=${{ matrix.config }}
+
+      - name: Build
+        run: cmake --build build --config ${{ matrix.config }} --parallel
+
+      # 多配置生成器会把产物放到 build/bin/<Config>/，单配置则直接在 build/bin/。
+      # 这里按文件搜索而不是硬编码子目录，两种布局都不会误报。
+      - name: Verify artifacts
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:GITHUB_WORKSPACE 'build\bin'
+          $exe = Get-ChildItem $root -Recurse -Filter HeapExplorer.exe -File -ErrorAction SilentlyContinue |
+                 Select-Object -First 1
+          if (-not $exe) {
+            Write-Error "No HeapExplorer.exe under $root"
+            exit 1
+          }
+          $bin = $exe.Directory.FullName
+          Write-Host "Artifact directory: $bin"
+
+          $missing = @()
+          foreach ($f in 'HeapExplorer.exe', 'launcher.exe', 'worker.dll') {
+            if (Test-Path (Join-Path $bin $f)) { Write-Host "OK   $f" }
+            else { Write-Host "MISS $f"; $missing += $f }
+          }
+          if ($missing.Count -gt 0) {
+            Write-Error "Build produced no $($missing -join ', ') in $bin"
+            exit 1
+          }
+
+          Write-Host ''
+          Get-ChildItem $bin -File | Get-FileHash -Algorithm SHA256 |
+            Format-Table Hash, Path -AutoSize
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: HeapExplorer-${{ matrix.config }}-x64
+          path: build\bin\
+          if-no-files-found: error
+          # Debug 包只在需要时保留 3 天，Release 包留 30 天
+          retention-days: ${{ matrix.config == 'Release' && 30 || 3 }}
