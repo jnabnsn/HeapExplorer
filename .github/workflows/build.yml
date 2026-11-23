@@ -1,6 +1,7 @@
 name: Build
 
 # 触发条件：主干分支的推送、PR、打标签、以及手动触发
+# 打 v* 标签时会额外把 Release 产物打包发布到 GitHub Release
 on:
   push:
     branches: [main]
@@ -131,3 +132,50 @@ jobs:
           if-no-files-found: error
           # Debug 包只在需要时保留 3 天，Release 包留 30 天
           retention-days: ${{ matrix.config == 'Release' && 30 || 3 }}
+
+  # 打 v* 标签时，把上面已经构建好的 Release 产物打成 zip 挂到 GitHub Release。
+  # 不重新编译：直接复用 build 矩阵里 Release 那条腿上传的 artifact。
+  release:
+    name: Publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: windows-latest
+    permissions:
+      contents: write      # 创建 Release 需要写权限（其它 job 仍只有 read）
+    steps:
+      - name: Checkout (README 一并打进包)
+        uses: actions/checkout@v4
+
+      - name: Download Release build
+        uses: actions/download-artifact@v4
+        with:
+          name: HeapExplorer-Release-x64
+          path: dist
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $zip = "HeapExplorer-$tag-win-x64.zip"
+          Copy-Item README.md dist\README.md
+          Compress-Archive -Path dist\* -DestinationPath $zip -Force
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          "$hash  $zip" | Set-Content SHA256SUMS.txt -Encoding ascii
+          Get-Content SHA256SUMS.txt
+          Get-ChildItem dist | Format-Table Name, Length -AutoSize
+
+      - name: Create or update GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          # 已有同名 Release 就只补传资产，避免重跑时 gh release create 报错
+          gh release view $env:TAG -R $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $env:TAG -R $env:GITHUB_REPOSITORY --title $env:TAG --generate-notes
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          gh release upload $env:TAG "HeapExplorer-$env:TAG-win-x64.zip" SHA256SUMS.txt `
+            -R $env:GITHUB_REPOSITORY --clobber
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
