@@ -158,9 +158,16 @@ jobs:
           $tag = "${{ github.ref_name }}"
           $zip = "HeapExplorer-$tag-win-x64.zip"
           Copy-Item README.md dist\README.md
+
+          # SHA256SUMS 覆盖所有上传的资产：三个裸文件 + zip，方便逐个校验
+          $sums = foreach ($f in 'HeapExplorer.exe', 'launcher.exe', 'worker.dll') {
+            $h = (Get-FileHash (Join-Path dist $f) -Algorithm SHA256).Hash.ToLower()
+            "$h  $f"
+          }
           Compress-Archive -Path dist\* -DestinationPath $zip -Force
-          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
-          "$hash  $zip" | Set-Content SHA256SUMS.txt -Encoding ascii
+          $sums += "$((Get-FileHash $zip -Algorithm SHA256).Hash.ToLower())  $zip"
+          $sums | Set-Content SHA256SUMS.txt -Encoding ascii
+
           Get-Content SHA256SUMS.txt
           Get-ChildItem dist | Format-Table Name, Length -AutoSize
 
@@ -176,6 +183,12 @@ jobs:
             gh release create $env:TAG -R $env:GITHUB_REPOSITORY --title $env:TAG --generate-notes
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
-          gh release upload $env:TAG "HeapExplorer-$env:TAG-win-x64.zip" SHA256SUMS.txt `
+          # 三个二进制裸传 + zip + 校验和（gh 用文件名作为资产名）
+          gh release upload $env:TAG `
+            (Join-Path 'dist' 'HeapExplorer.exe') `
+            (Join-Path 'dist' 'launcher.exe') `
+            (Join-Path 'dist' 'worker.dll') `
+            "HeapExplorer-$env:TAG-win-x64.zip" `
+            SHA256SUMS.txt `
             -R $env:GITHUB_REPOSITORY --clobber
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
